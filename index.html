@@ -80,7 +80,7 @@
    ========================================================================= */
 const params   = new URLSearchParams(location.search);
 const rideCode = (params.get('ride') || 'MUM01').toUpperCase();
-const myId     = params.get('me');
+const myId     = params.get('me') || 'rjobvpom';
 const DEMO     = params.get('demo') === '1';
 
 const $ = id => document.getElementById(id);
