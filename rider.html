@@ -104,11 +104,13 @@ import { getDatabase, ref, onValue, set, remove, onDisconnect }
 import { firebaseConfig, STALE_MS, DROP_MS } from './config.js';
 
 /* ---------- identity ---------- */
-const myId = localStorage.getItem('xdg-rider-id') ||
+const params = new URLSearchParams(location.search);
+
+const myId = params.get('id') ||
+  localStorage.getItem('xdg-rider-id') ||
   (() => { const v = 'r' + Math.random().toString(36).slice(2, 9);
            localStorage.setItem('xdg-rider-id', v); return v; })();
-
-const params = new URLSearchParams(location.search);
+if (params.get('id')) localStorage.setItem('xdg-rider-id', params.get('id'));
 const $ = id => document.getElementById(id);
 
 $('name').value = params.get('name') || localStorage.getItem('xdg-rider-name') || '';
