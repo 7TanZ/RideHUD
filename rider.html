@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="theme-color" content="#000000">
+  <title>XDG Ride · Rider</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0; min-height: 100%;
+      background: #000; color: #fff;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+      -webkit-text-size-adjust: 100%;
+    }
+    body { padding: 24px 20px 40px; }
+
+    header { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 28px; }
+    .brand { color: #17d4e4; font: 13px ui-monospace, Menlo, monospace; letter-spacing: .16em; }
+    .dot { width: 10px; height: 10px; border-radius: 50%; background: #444; display: inline-block; margin-left: 8px; }
+    .dot.live { background: #4dffb8; box-shadow: 0 0 10px #4dffb8; }
+    .dot.err  { background: #ff9d3d; }
+
+    h1 { margin: 0 0 22px; font-size: 34px; letter-spacing: -.03em; line-height: 1.05; }
+
+    label { display: block; color: #8a9a94; font: 12px ui-monospace, monospace; letter-spacing: .14em; text-transform: uppercase; margin: 18px 0 8px; }
+    input {
+      width: 100%; padding: 16px 18px; font-size: 20px;
+      background: #0d0d0d; color: #fff;
+      border: 2px solid #1f2a2e; border-radius: 14px; outline: none;
+    }
+    input:focus { border-color: #17d4e4; }
+
+    button {
+      width: 100%; margin-top: 26px; padding: 20px;
+      font-size: 20px; font-weight: 600; letter-spacing: .02em;
+      background: #17d4e4; color: #000;
+      border: 0; border-radius: 16px; cursor: pointer;
+    }
+    button.secondary { background: transparent; color: #8a9a94; border: 2px solid #1f2a2e; margin-top: 12px; }
+
+    .hidden { display: none; }
+
+    .status { margin: 20px 0 8px; color: #8a9a94; font: 13px ui-monospace, monospace; letter-spacing: .1em; }
+    .selfgap { font-size: 76px; letter-spacing: -.05em; margin: 4px 0 2px; font-variant-numeric: tabular-nums; }
+    .selfgap .unit { font-size: 28px; color: #8a9a94; margin-left: 8px; }
+    .selfline { color: #c7d3e3; font-size: 19px; margin-bottom: 26px; }
+
+    ul { list-style: none; padding: 0; margin: 0; }
+    li {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 16px 0; border-top: 1px solid #1a1a1a;
+      font-size: 19px;
+    }
+    li .name { letter-spacing: .04em; }
+    li .gap { font-variant-numeric: tabular-nums; color: #17d4e4; }
+    li .gap.close { color: #4dffb8; }
+    li .gap.drift { color: #e5f46b; }
+    li .gap.lost  { color: #ff9d3d; }
+    li .gap.stale { color: #ff9d3d; font-size: 15px; }
+
+    .note { margin-top: 28px; color: #5c6a6a; font-size: 14px; line-height: 1.5; }
+    .err { color: #ff9d3d; font-size: 16px; margin-top: 14px; }
+  </style>
+</head>
+<body>
+
+  <header>
+    <span class="brand">XDG · RIDE</span>
+    <span class="brand">RIDER<span class="dot" id="dot"></span></span>
+  </header>
+
+  <!-- ---------- JOIN ---------- -->
+  <section id="join">
+    <h1>Join the ride</h1>
+    <label for="name">Your name</label>
+    <input id="name" placeholder="ARJUN" autocomplete="off" maxlength="12">
+    <label for="code">Ride code</label>
+    <input id="code" placeholder="MUM01" autocomplete="off" maxlength="8">
+    <button id="go">Start sharing location</button>
+    <button class="secondary" id="speakToggle">Voice updates: ON</button>
+    <p class="note">
+      Your phone shares its position with this ride only, while this page is open.
+      Close the tab and sharing stops. Keep the screen awake for best accuracy.
+    </p>
+    <div class="err hidden" id="joinErr"></div>
+  </section>
+
+  <!-- ---------- LIVE ---------- -->
+  <section id="live" class="hidden">
+    <div class="status" id="status">ACQUIRING GPS…</div>
+    <div class="selfgap"><span id="selfNum">—</span><span class="unit" id="selfUnit"></span></div>
+    <div class="selfline" id="selfLine">Waiting for the group…</div>
+    <div class="status">EVERYONE ELSE</div>
+    <ul id="list"></ul>
+    <button class="secondary" id="leave">Leave ride</button>
+    <div class="err hidden" id="liveErr"></div>
+  </section>
+
+<script type="module">
+import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js';
+import { getDatabase, ref, onValue, set, remove, onDisconnect }
+  from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-database.js';
+import { firebaseConfig, STALE_MS, DROP_MS } from './config.js';
+
+/* ---------- identity ---------- */
+const myId = localStorage.getItem('xdg-rider-id') ||
+  (() => { const v = 'r' + Math.random().toString(36).slice(2, 9);
+           localStorage.setItem('xdg-rider-id', v); return v; })();
+
+const params = new URLSearchParams(location.search);
+const $ = id => document.getElementById(id);
+
+$('name').value = params.get('name') || localStorage.getItem('xdg-rider-name') || '';
+$('code').value = (params.get('ride') || localStorage.getItem('xdg-ride-code') || 'MUM01').toUpperCase();
+
+let speak = true;
+$('speakToggle').onclick = () => {
+  speak = !speak;
+  $('speakToggle').textContent = 'Voice updates: ' + (speak ? 'ON' : 'OFF');
+  if (speak) say('Voice updates on');
+};
+
+/* ---------- firebase ---------- */
+let db;
+try { db = getDatabase(initializeApp(firebaseConfig)); }
+catch (e) { $('joinErr').classList.remove('hidden'); $('joinErr').textContent = 'Firebase config missing — edit config.js'; }
+
+let myRef = null, watchId = null, rideCode = null, myName = null;
+let others = {}, myPos = null, lastGap = {}, lastBand = {};
+
+/* ---------- geo maths ---------- */
+function distanceM(a, b) {
+  const R = 6371000, rad = d => d * Math.PI / 180;
+  const dLat = rad(b.lat - a.lat), dLng = rad(b.lng - a.lng);
+  const h = Math.sin(dLat / 2) ** 2 +
+            Math.cos(rad(a.lat)) * Math.cos(rad(b.lat)) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+const bandFor = g => g < 100 ? 'close' : g < 400 ? 'ok' : g < 1000 ? 'drift' : 'lost';
+const fmt = g => g >= 1000
+  ? { n: (g / 1000).toFixed(1), u: 'km' }
+  : { n: String(Math.round(g / 10) * 10), u: 'm' };
+
+/* ---------- speech out to the helmet ---------- */
+function say(text) {
+  if (!speak || !window.speechSynthesis) return;
+  const u = new SpeechSynthesisUtterance(text);
+  u.rate = 1.05; u.volume = 1;
+  speechSynthesis.speak(u);
+}
+
+/* ---------- start ---------- */
+$('go').onclick = () => {
+  myName = ($('name').value || 'RIDER').trim().toUpperCase().slice(0, 12);
+  rideCode = ($('code').value || 'MUM01').trim().toUpperCase();
+  localStorage.setItem('xdg-rider-name', myName);
+  localStorage.setItem('xdg-ride-code', rideCode);
+
+  if (!navigator.geolocation) {
+    $('joinErr').classList.remove('hidden');
+    $('joinErr').textContent = 'This browser has no geolocation.';
+    return;
+  }
+
+  $('join').classList.add('hidden');
+  $('live').classList.remove('hidden');
+
+  myRef = ref(db, `rides/${rideCode}/${myId}`);
+  onDisconnect(myRef).remove();            // clean up if the phone drops off
+  onValue(ref(db, `rides/${rideCode}`), snap => { others = snap.val() || {}; render(); });
+
+  watchId = navigator.geolocation.watchPosition(onFix, onGeoErr, {
+    enableHighAccuracy: true, maximumAge: 2000, timeout: 10000
+  });
+
+  keepAwake();
+  say('Joined ride ' + rideCode.split('').join(' '));
+};
+
+$('leave').onclick = async () => {
+  if (watchId != null) navigator.geolocation.clearWatch(watchId);
+  if (myRef) await remove(myRef).catch(() => {});
+  location.reload();
+};
+
+/* ---------- gps ---------- */
+let lastPublish = 0;
+function onFix(pos) {
+  myPos = { lat: pos.coords.latitude, lng: pos.coords.longitude, acc: pos.coords.accuracy };
+  $('dot').className = 'dot live';
+  $('status').textContent =
+    `LIVE · ±${Math.round(myPos.acc)}m · ${rideCode} · ${myName}`;
+
+  const now = Date.now();
+  if (now - lastPublish > 1800) {           // throttle writes
+    lastPublish = now;
+    set(myRef, { name: myName, lat: myPos.lat, lng: myPos.lng, acc: myPos.acc, t: now })
+      .catch(e => { $('liveErr').classList.remove('hidden'); $('liveErr').textContent = 'Write failed: ' + e.code; });
+  }
+  render();
+}
+function onGeoErr(err) {
+  $('dot').className = 'dot err';
+  $('status').textContent = 'GPS ERROR · ' + err.message.toUpperCase();
+}
+
+/* ---------- render ---------- */
+function render() {
+  if (!myPos) return;
+  const now = Date.now();
+  const list = $('list');
+  list.innerHTML = '';
+
+  const rows = [];
+  for (const [id, r] of Object.entries(others)) {
+    if (id === myId || !r || typeof r.lat !== 'number') continue;
+    const age = now - (r.t || 0);
+    if (age > DROP_MS) continue;
+    const gap = distanceM(myPos, r);
+    rows.push({ id, name: r.name || '—', gap, age, stale: age > STALE_MS });
+  }
+  rows.sort((a, b) => a.gap - b.gap);
+
+  // my own headline number = distance to the nearest other rider
+  const nearest = rows.filter(r => !r.stale)[0];
+  if (nearest) {
+    const f = fmt(nearest.gap);
+    $('selfNum').textContent = f.n;
+    $('selfUnit').textContent = f.u;
+    const trend = lastGap[nearest.id] != null
+      ? (nearest.gap < lastGap[nearest.id] - 3 ? 'closing' : nearest.gap > lastGap[nearest.id] + 3 ? 'opening' : 'steady')
+      : 'steady';
+    $('selfLine').textContent = `${nearest.name} · ${trend}`;
+
+    // speak only on band change, and only for the nearest rider
+    const band = bandFor(nearest.gap);
+    if (lastBand[nearest.id] && lastBand[nearest.id] !== band) {
+      if (band === 'lost')  say(`You are dropped. ${f.n} ${f.u === 'km' ? 'kilometres' : 'metres'} back.`);
+      if (band === 'drift') say(`Gap opening. ${f.n} metres.`);
+      if (band === 'close') say('Back on.');
+    }
+    lastBand[nearest.id] = band;
+  } else {
+    $('selfNum').textContent = '—';
+    $('selfUnit').textContent = '';
+    $('selfLine').textContent = rows.length ? 'No signal from the group' : 'Waiting for the group…';
+  }
+
+  for (const r of rows) {
+    lastGap[r.id] = r.gap;
+    const li = document.createElement('li');
+    const f = fmt(r.gap);
+    li.innerHTML = `<span class="name">${r.name}</span>` +
+      (r.stale
+        ? `<span class="gap stale">NO SIGNAL · ${Math.round(r.age / 1000)}s</span>`
+        : `<span class="gap ${bandFor(r.gap)}">${f.n}${f.u}</span>`);
+    list.appendChild(li);
+  }
+}
+setInterval(render, 1000);   // keeps staleness counters ticking
+
+/* ---------- keep the screen on ---------- */
+async function keepAwake() {
+  try { if ('wakeLock' in navigator) await navigator.wakeLock.request('screen'); } catch {}
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') keepAwake();
+});
+</script>
+</body>
+</html>

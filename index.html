@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="mrbd-web-app-capable" content="yes">
+  <meta name="viewport" content="width=600, height=600, initial-scale=1.0, user-scalable=no">
+  <meta name="theme-color" content="#000000">
+  <title>XDG Ride · Gap HUD</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body {
+      width: 600px; height: 600px; margin: 0; overflow: hidden;
+      background: #000; color: #fff;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    body { display: grid; place-items: center; padding: 42px; }
+
+    .hud {
+      width: 100%; height: 100%;
+      border: 2px solid #17d4e4; border-radius: 28px; padding: 34px;
+      display: flex; flex-direction: column; justify-content: space-between;
+      outline: none;
+      box-shadow: 0 0 34px rgba(23,212,228,.22);
+      transition: border-color .18s, box-shadow .18s;
+    }
+    .hud:focus { border-color: #e5f46b; box-shadow: 0 0 38px rgba(229,244,107,.32); }
+
+    .hud[data-status="close"] { border-color:#4dffb8; box-shadow:0 0 34px rgba(77,255,184,.22); }
+    .hud[data-status="ok"]    { border-color:#17d4e4; box-shadow:0 0 34px rgba(23,212,228,.22); }
+    .hud[data-status="drift"] { border-color:#e5f46b; box-shadow:0 0 38px rgba(229,244,107,.30); }
+    .hud[data-status="lost"]  { border-color:#ff9d3d; box-shadow:0 0 40px rgba(255,157,61,.34); }
+    .hud[data-status="stale"] { border-color:#ff9d3d; box-shadow:0 0 44px rgba(255,157,61,.42); }
+    .hud[data-status="wait"]  { border-color:#3a4a4e; box-shadow:none; }
+
+    .meta, .controls {
+      display: flex; justify-content: space-between; gap: 12px;
+      color: #17d4e4;
+      font: 14px ui-monospace, SFMono-Regular, Menlo, monospace;
+      letter-spacing: .12em; text-transform: uppercase;
+    }
+    .controls { color: #8a9a94; }
+
+    .rider {
+      margin: 0 0 6px;
+      font: 600 26px/1 system-ui, sans-serif;
+      letter-spacing: .06em; text-transform: uppercase; color: #c7d3e3;
+    }
+    .pin { color: #e5f46b; }
+
+    h1 {
+      margin: 0; font-size: 132px; line-height: .82;
+      letter-spacing: -.06em; font-variant-numeric: tabular-nums;
+    }
+    h1.small { font-size: 76px; letter-spacing: -.04em; }
+    h1 .unit { font-size: 44px; letter-spacing: -.02em; margin-left: 10px; color: #8a9a94; }
+
+    p { max-width: 440px; margin: 18px 0 0; color: #c7d3e3; font-size: 24px; line-height: 1.28; }
+    .trend { color: #fff; font-weight: 600; }
+    .state { color: #e5f46b; font: 16px ui-monospace, Menlo, monospace; letter-spacing: .08em; }
+  </style>
+</head>
+<body>
+  <main class="hud" id="hud" tabindex="0" data-status="wait">
+    <div class="meta"><span>XDG</span><span id="group">CONNECTING…</span></div>
+    <section>
+      <div class="rider" id="rider">— <span class="pin" id="pin"></span></div>
+      <h1 id="gapWrap"><span id="gap">—</span><span class="unit" id="unit"></span></h1>
+      <p><span class="trend" id="trend"></span> <span id="message">Waiting for riders to join.</span></p>
+    </section>
+    <div class="controls"><span class="state" id="state">Auto</span><span>← → Enter Esc</span></div>
+  </main>
+
+<script type="module">
+/* =========================================================================
+   URL parameters:
+     ?ride=MUM01   ride code (must match what riders type)
+     &me=r8x2ka9   YOUR rider id — from your own phone's rider.html
+                   (localStorage key 'xdg-rider-id', shown in console)
+     &demo=1       run with fake data, no Firebase needed
+   ========================================================================= */
+const params   = new URLSearchParams(location.search);
+const rideCode = (params.get('ride') || 'MUM01').toUpperCase();
+const myId     = params.get('me');
+const DEMO     = params.get('demo') === '1';
+
+const $ = id => document.getElementById(id);
+const hud = $('hud');
+
+let riders = {};   // id -> { name, lat, lng, t }
+let myPos  = null;
+let index  = 0;
+let pinned = false;
+let prevGap = {}, prevT = {};
+
+const STALE_MS = 20000, DROP_MS = 300000;
+
+/* ---------- maths ---------- */
+function distanceM(a, b) {
+  const R = 6371000, rad = d => d * Math.PI / 180;
+  const dLat = rad(b.lat - a.lat), dLng = rad(b.lng - a.lng);
+  const h = Math.sin(dLat/2)**2 +
+            Math.cos(rad(a.lat)) * Math.cos(rad(b.lat)) * Math.sin(dLng/2)**2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+const bandFor = g => g < 100 ? 'close' : g < 400 ? 'ok' : g < 1000 ? 'drift' : 'lost';
+const fmt = g => g >= 1000 ? { n:(g/1000).toFixed(1), u:'km' } : { n:String(Math.round(g/10)*10), u:'m' };
+
+function copyFor(gap, vel) {
+  const closing = vel < -0.3, opening = vel > 0.3;
+  const b = bandFor(gap);
+  if (b === 'close') return [closing ? 'On your wheel' : 'Right behind', '— group is tight.'];
+  if (b === 'ok')    return [closing ? 'Closing' : opening ? 'Easing back' : 'Holding', closing ? '— hold your line.' : '— soft-pedal a little.'];
+  if (b === 'drift') return [closing ? 'Pulling back on' : 'Drifting', closing ? '— gap is coming down.' : '— ease off, let it close.'];
+  return ['Dropped', '— wait at the next junction.'];
+}
+
+/* ---------- build the list of gaps ---------- */
+function computeRows() {
+  const now = Date.now();
+  const rows = [];
+  for (const [id, r] of Object.entries(riders)) {
+    if (id === myId || !r || typeof r.lat !== 'number') continue;
+    const age = now - (r.t || 0);
+    if (age > DROP_MS) continue;
+    const gap = myPos ? distanceM(myPos, r) : null;
+
+    let vel = 0;
+    if (gap != null && prevGap[id] != null && prevT[id]) {
+      const dt = (now - prevT[id]) / 1000;
+      if (dt > 0.5) { vel = (gap - prevGap[id]) / dt; prevGap[id] = gap; prevT[id] = now; }
+    } else if (gap != null) { prevGap[id] = gap; prevT[id] = now; }
+
+    rows.push({ id, name: r.name || '—', gap, vel, age, stale: age > STALE_MS });
+  }
+  return rows;
+}
+
+/* ---------- render ---------- */
+function render() {
+  const rows = computeRows();
+  $('group').textContent = rows.length
+    ? `${rideCode} · ${rows.length + 1} UP`
+    : `${rideCode} · WAITING`;
+
+  if (!myPos || rows.length === 0) {
+    hud.dataset.status = 'wait';
+    $('rider').firstChild.nodeValue = '— ';
+    $('gap').textContent = '—'; $('unit').textContent = '';
+    $('gapWrap').className = 'small';
+    $('trend').textContent = '';
+    $('message').textContent = !myPos
+      ? (myId ? 'Open rider.html on your own phone to set your position.' : 'No rider id — add &me=YOUR_ID to the URL.')
+      : 'Waiting for riders to join ' + rideCode + '.';
+    $('state').textContent = 'Standby';
+    return;
+  }
+
+  // auto mode: show whoever needs attention — stale beats far, far beats near
+  if (!pinned) {
+    const stale = rows.filter(r => r.stale);
+    const pool  = stale.length ? stale : rows;
+    const worstId = pool.reduce((w, r) => (r.gap ?? 0) > (pool[w].gap ?? 0) ? pool.indexOf(r) : w, 0);
+    index = rows.indexOf(pool[worstId]);
+  }
+  if (index < 0 || index >= rows.length) index = 0;
+
+  const r = rows[index];
+  $('rider').firstChild.nodeValue = r.name + ' ';
+  $('pin').textContent = pinned ? '· PINNED' : '';
+  $('state').textContent = pinned
+    ? `Pinned ${String(index+1).padStart(2,'0')}/${String(rows.length).padStart(2,'0')}`
+    : 'Auto · worst';
+
+  if (r.stale) {
+    hud.dataset.status = 'stale';
+    $('gapWrap').className = 'small';
+    $('gap').textContent = 'NO SIGNAL';
+    $('unit').textContent = '';
+    $('trend').textContent = `${Math.round(r.age/1000)}s`;
+    $('message').textContent = '— last seen ' + fmt(r.gap).n + fmt(r.gap).u + ' back. Stop and wait.';
+    return;
+  }
+
+  const f = fmt(r.gap);
+  const [trend, msg] = copyFor(r.gap, r.vel);
+  hud.dataset.status = bandFor(r.gap);
+  $('gapWrap').className = '';
+  $('gap').textContent = f.n;
+  $('unit').textContent = f.u;
+  $('trend').textContent = trend;
+  $('message').textContent = msg;
+}
+
+/* ---------- input ---------- */
+hud.focus();
+document.addEventListener('keydown', e => {
+  const n = Math.max(1, computeRows().length);
+  if (e.key === 'ArrowRight') { index = (index + 1) % n; pinned = true; }
+  if (e.key === 'ArrowLeft')  { index = (index + n - 1) % n; pinned = true; }
+  if (e.key === 'Enter')      { pinned = true; }
+  if (e.key === 'Escape')     { pinned = false; }
+  render();
+});
+setInterval(render, 1000);
+
+/* ---------- data source ---------- */
+if (DEMO) {
+  // fake a ride around Marine Drive so you can demo with no phones at all
+  const base = { lat: 18.9440, lng: 72.8230 };
+  const fake = [
+    { id:'me',  name:'YOU',   off:0,     vel:0 },
+    { id:'a',   name:'ARJUN', off:0.0021, vel:-0.00002 },
+    { id:'b',   name:'PRIYA', off:0.0006, vel: 0.000005 },
+    { id:'c',   name:'RAHUL', off:0.0090, vel: 0.00003 }
+  ];
+  setInterval(() => {
+    const now = Date.now();
+    riders = {};
+    for (const f of fake) {
+      f.off = Math.max(0.00004, f.off + f.vel + (Math.random()-0.5)*0.00006);
+      if (Math.random() < 0.03) f.vel *= -1;
+      riders[f.id] = { name:f.name, lat: base.lat - f.off, lng: base.lng, t: now };
+    }
+    myPos = riders['me'];
+    render();
+  }, 900);
+  document.querySelector('.meta span').textContent = 'XDG · DEMO';
+} else {
+  const { initializeApp } = await import('https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js');
+  const { getDatabase, ref, onValue } = await import('https://www.gstatic.com/firebasejs/10.12.2/firebase-database.js');
+  const { firebaseConfig } = await import('./config.js');
+
+  try {
+    const db = getDatabase(initializeApp(firebaseConfig));
+    onValue(ref(db, 'rides/' + rideCode), snap => {
+      riders = snap.val() || {};
+      if (myId && riders[myId]) myPos = riders[myId];
+      render();
+    }, err => {
+      $('message').textContent = 'Firebase error: ' + err.code;
+    });
+  } catch (e) {
+    $('message').textContent = 'Config missing — edit config.js';
+  }
+}
+render();
+</script>
+</body>
+</html>
